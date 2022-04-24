@@ -88,6 +88,7 @@ class Ifc(nn.Module):
         dec_layers = cfg.MODEL.IFC.DEC_LAYERS
         pre_norm = cfg.MODEL.IFC.PRE_NORM
         num_memory_bus = cfg.MODEL.IFC.NUM_MEMORY_BUS
+        deformable = cfg.MODEL.IFC.DEFORMABLE
 
         # Loss parameters:
         mask_weight = cfg.MODEL.IFC.MASK_WEIGHT
@@ -111,6 +112,7 @@ class Ifc(nn.Module):
             num_decoder_layers=dec_layers,
             normalize_before=pre_norm,
             return_intermediate_dec=deep_supervision,
+            deformable = deformable
         )
         mask_head = MaskHead(hidden_dim, [1024, 512], self.num_frames)
 

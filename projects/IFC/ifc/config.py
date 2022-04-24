@@ -35,6 +35,8 @@ def add_ifc_config(cfg):
     cfg.MODEL.IFC.HIDDEN_DIM = 256
     cfg.MODEL.IFC.NUM_OBJECT_QUERIES = 100
 
+    cfg.MODEL.IFC.DEFORMABLE = 0
+
     # Evaluation
     cfg.MODEL.IFC.CLIP_STRIDE = 1
     cfg.MODEL.IFC.MERGE_ON_CPU = False
