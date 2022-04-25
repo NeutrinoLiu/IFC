@@ -11,37 +11,6 @@ from torch import nn, Tensor
 
 from ..ops.modules import MSDeformAttn
 
-# util function used by deformable-attention
-def get_valid_ratio(mask):
-    _, H, W = mask.shape
-    valid_H = torch.sum(~mask[:, :, 0], 1)
-    valid_W = torch.sum(~mask[:, 0, :], 1)
-    valid_ratio_h = valid_H.float() / H
-    valid_ratio_w = valid_W.float() / W
-    valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
-    return valid_ratio
-
-def get_reference_points(spatial_shapes, valid_ratios, device):
-    reference_points_list = []
-    for lvl, (H_, W_) in enumerate(spatial_shapes):
-
-        ref_y, ref_x = torch.meshgrid(torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
-                                      torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device))
-        ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H_)
-        ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W_)
-        ref = torch.stack((ref_x, ref_y), -1)
-        reference_points_list.append(ref)
-    reference_points = torch.cat(reference_points_list, 1)
-    reference_points = reference_points[:, :, None] * valid_ratios[:, None]
-    return reference_points
-
-def gen_encoder_input(src, mask, pos):
-    return None
-    # cs839 TODO
-
-# =======================================
-
-
 class IFCTransformer(nn.Module):
 
     def __init__(self, num_frames, d_model=256, nhead=8,
@@ -58,8 +27,12 @@ class IFCTransformer(nn.Module):
         encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before, 
                                                 deformable)
+        memory_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
+                                                dropout, activation, normalize_before, 
+                                                deformable=0) # do not use deformable for memory
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
-        self.encoder = IFCEncoder(num_frames, encoder_layer, num_encoder_layers, encoder_norm)
+        self.encoder = IFCEncoder(num_frames, encoder_layer, memory_layer, num_encoder_layers, encoder_norm)
+                                    
 
         decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
@@ -97,6 +70,7 @@ class IFCTransformer(nn.Module):
         bs = src.shape[0] // self.num_frames if is_train else 1
         t = src.shape[0] // bs
         _, c, h, w = src.shape
+        all_shape = {'h':h, 'w':w, 'bs':bs, 't':t}
 
         memory_bus = self.memory_bus
         memory_pos = self.memory_pos
@@ -106,7 +80,7 @@ class IFCTransformer(nn.Module):
         frame_pos = pos_embed.view(bs*t, c, h*w).permute(2, 0, 1)   # HW, BT, C
         frame_mask = mask.view(bs*t, h*w)                           # BT, HW
 
-        src, memory_bus = self.encoder(src, memory_bus, memory_pos, src_key_padding_mask=frame_mask, pos=frame_pos, is_train=is_train)
+        src, memory_bus = self.encoder(src, memory_bus, memory_pos, src_key_padding_mask=frame_mask, pos=frame_pos, is_train=is_train, all_shape=all_shape)
 
         # decoder
         dec_src = src.view(h*w, bs, t, c).permute(2, 0, 1, 3).flatten(0,1)
@@ -126,47 +100,94 @@ class IFCTransformer(nn.Module):
 
 class IFCEncoder(nn.Module):
 
-    def __init__(self, num_frames, encoder_layer, num_layers, norm=None):
+    def __init__(self, num_frames, encoder_layer, memory_layer, num_layers, norm=None):
         super().__init__()
         self.num_frames = num_frames
         self.num_layers = num_layers
         self.enc_layers = _get_clones(encoder_layer, num_layers)
-        self.bus_layers = _get_clones(encoder_layer, num_layers)
+        self.bus_layers = _get_clones(memory_layer, num_layers)
         norm = [copy.deepcopy(norm) for i in range(2)]
         self.out_norm, self.bus_norm = norm
 
-    def pad_zero(self, x, pad, dim=0):
+    @staticmethod
+    def pad_zero(x, pad, dim=0):
+        if pad == 0:
+            return x
         if x is None:
             return None
         pad_shape = list(x.shape)
         pad_shape[dim] = pad
         return torch.cat((x, x.new_zeros(pad_shape)), dim=dim)
 
+    @staticmethod
+    def pad_one(x, pad, dim=0):
+        if pad == 0:
+            return x
+        if x is None:
+            return None
+        pad_shape = list(x.shape)
+        pad_shape[dim] = pad
+        return torch.cat((x, x.new_ones(pad_shape)), dim=dim)
+    
+    @staticmethod
+    def expand_memory_with_dummy(memory, ext):
+        if ext == 0:
+            return memory
+        print("shape before", memory.shape)
+        dummy_extension = memory[0].clone().repeat(ext, 1)
+        ret = torch.cat((memory, dummy_extension))
+        print("shape after", memory.shape)
+        return ret
+
     def forward(self, src, memory_bus, memory_pos,
                 mask: Optional[Tensor] = None,
                 src_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
-                is_train: bool = True):
+                is_train: bool = True,
+                all_shape = None):
         bs = src.shape[1] // self.num_frames if is_train else 1
         t = src.shape[1] // bs
         hw, _, c = src.shape
         M = len(memory_bus)
+        all_shape['M'] = M
+        h = all_shape['h']
+        w = all_shape['w']
 
-        memory_bus = memory_bus[:, None, :].repeat(1, bs*t, 1)
+        # cs839: hence deformable attention is a 2d attention, HxW
+        # but IFC MHAtt is flattened 1d attention, HW+M
+        # we will fill the memory line to a full width of feature map
+        # so it looks like a 2d image, for example:
+        #   $$$$$$
+        #   $$$$$$
+        #   **oooo
+        # $-feature *-memory o-dummy extension
+
+        if M > w:
+            raise ValueError(f"Too larget the memory bus size {M} than the width of feature: {w}")
+
+        memory_pos = self.expand_memory_with_dummy(memory_pos, w-M)
         memory_pos = memory_pos[:, None, :].repeat(1, bs*t, 1)
-
         pos = torch.cat((pos, memory_pos))
+
+        memory_bus = self.expand_memory_with_dummy(memory_bus, w-M)
+        memory_bus = memory_bus[:, None, :].repeat(1, bs*t, 1)
+
+        # cs839
+        # now our image has height of h+1 with the extraline memory bus and its dummy extension
+        # no need for the dummy filling, we note the padding mask bit as True at that position
+        all_shape['h'] += 1
         mask = self.pad_zero(mask, M, dim=1)
+        mask = self.pad_one(mask, w-M, dim=1)
         src_key_padding_mask = self.pad_zero(src_key_padding_mask, M, dim=1)
-
+        src_key_padding_mask = self.pad_one(src_key_padding_mask, w-M, dim=1)
+        
         output = src
-
         for layer_idx in range(self.num_layers):
             output = torch.cat((output, memory_bus))
 
             output = self.enc_layers[layer_idx](output, src_mask=mask,
-                           src_key_padding_mask=src_key_padding_mask, pos=pos)
-            output, memory_bus = output[:hw, :, :], output[hw:, :, :]
+                           src_key_padding_mask=src_key_padding_mask, pos=pos, all_shape=all_shape)
+            output, memory_bus = output[:hw, :, :], output[hw:hw+M, :, :]
 
             memory_bus = memory_bus.view(M, bs, t, c).permute(2,1,0,3).flatten(1,2) # TxBMxC
             memory_bus = self.bus_layers[layer_idx](memory_bus)
@@ -274,55 +295,128 @@ class TransformerEncoderLayer(nn.Module):
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
+    @staticmethod
+    def get_reference_points(spatial_shapes, valid_ratios, device):
+        reference_points_list = []
+        for lvl, (H_, W_) in enumerate(spatial_shapes):
+
+            ref_y, ref_x = torch.meshgrid(torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
+                                        torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device))
+            ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H_)
+            ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W_)
+            ref = torch.stack((ref_x, ref_y), -1)
+            reference_points_list.append(ref)
+        reference_points = torch.cat(reference_points_list, 1)
+        reference_points = reference_points[:, :, None] * valid_ratios[:, None]
+        return reference_points
+
+    @staticmethod
+    def get_valid_ratio(self, mask, all_shape):
+        H = all_shape['h']
+        W = all_shape['w']
+        valid_H = torch.sum(~mask[:, :, 0], 1)
+        valid_W = torch.sum(~mask[:, 0, :], 1)
+        valid_ratio_h = valid_H.float() / H
+        valid_ratio_w = valid_W.float() / W
+        valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
+        return valid_ratio
+
     def forward_post(self,
                      src,
                      src_mask: Optional[Tensor] = None,
                      src_key_padding_mask: Optional[Tensor] = None,
-                     pos: Optional[Tensor] = None):
+                     pos: Optional[Tensor] = None,
+                     all_shape=None):
+        q = k = self.with_pos_embed(src, pos)
+
         if not self.deformable:
-            q = k = self.with_pos_embed(src, pos)
             src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
-                                key_padding_mask=src_key_padding_mask)[0]
-            src = src + self.dropout1(src2)
-            src = self.norm1(src)
-            src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-            src = src + self.dropout2(src2)
-            src = self.norm2(src)
-            return src
+                            key_padding_mask=src_key_padding_mask)[0]
+                            # nn.MHA will output (output, weights), only former is needed
         else:
             # cs839 different interface for deformable attention
-            # TODO
-            spatial_shapes, valid_ratios = gen_encoder_input(src, src_mask, pos)
+            if all_shape == None:
+                raise ValueError("frame_shape is not provided for forward")
+            spatial_shapes = [(all_shape['h'], all_shape['w'])]
+            spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src.device)
+            level_start_index = [0, src_key_padding_mask.shape[1]]
+            
+            valid_ratios = self.get_valid_ratio(src_key_padding_mask, all_shape)
             reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
-            output = self.self_attn()
-            # also some norm and linear layers
-            return output
+            
+            # cs839
+            # util function used by deformable-attention
+            NLC2LNC = LNC2NLC = lambda src: src.permute(1,0,2)
+
+            src2 = NLC2LNC(
+                self.self_attn(
+                    LNC2NLC(q),
+                    reference_points,
+                    LNC2NLC(src),
+                    spatial_shapes,
+                    level_start_index,
+                    src_key_padding_mask)
+                )
+
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src
 
     def forward_pre(self, src,
                     src_mask: Optional[Tensor] = None,
                     src_key_padding_mask: Optional[Tensor] = None,
-                    pos: Optional[Tensor] = None):
+                    pos: Optional[Tensor] = None,
+                    all_shape = None):
+        src2 = self.norm1(src)
+        q = k = self.with_pos_embed(src2, pos)
+
         if not self.deformable:
-            src2 = self.norm1(src)
-            q = k = self.with_pos_embed(src2, pos)
-            src2 = self.self_attn(q, k, value=src2, attn_mask=src_mask,
-                                key_padding_mask=src_key_padding_mask)[0]
-            src = src + self.dropout1(src2)
-            src2 = self.norm2(src)
-            src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
-            src = src + self.dropout2(src2)
-            return src
+            src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
+                            key_padding_mask=src_key_padding_mask)[0]
+                            # nn.MHA will output (output, weights), only former is needed
         else:
             # cs839 different interface for deformable attention
-            return None
+            if all_shape == None:
+                raise ValueError("frame_shape is not provided for forward")
+            spatial_shapes = [(all_shape['h'], all_shape['w'])]
+            spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src.device)
+            level_start_index = [0, src_key_padding_mask.shape[1]]
+            
+            valid_ratios = self.get_valid_ratio(src_key_padding_mask, all_shape)
+            reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
+            
+            # cs839
+            # util function used by deformable-attention
+            NLC2LNC = LNC2NLC = lambda src: src.permute(1,0,2)
+
+            src2 = NLC2LNC(
+                self.self_attn(
+                    LNC2NLC(q),
+                    reference_points,
+                    LNC2NLC(src),
+                    spatial_shapes,
+                    level_start_index,
+                    src_key_padding_mask)
+                )
+
+        src = src + self.dropout1(src2)
+        src2 = self.norm2(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
+        src = src + self.dropout2(src2)
+        return src
+
 
     def forward(self, src,
                 src_mask: Optional[Tensor] = None,
                 src_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None):
+                pos: Optional[Tensor] = None,
+                all_shape = None):
         if self.normalize_before:
-            return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
-        return self.forward_post(src, src_mask, src_key_padding_mask, pos)
+            return self.forward_pre(src, src_mask, src_key_padding_mask, pos, all_shape)
+        return self.forward_post(src, src_mask, src_key_padding_mask, pos, all_shape)
 
 
 class TransformerDecoderLayer(nn.Module):
