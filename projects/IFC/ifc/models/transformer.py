@@ -128,16 +128,6 @@ class IFCEncoder(nn.Module):
         pad_shape = list(x.shape)
         pad_shape[dim] = pad
         return torch.cat((x, x.new_ones(pad_shape)), dim=dim)
-    
-    @staticmethod
-    def expand_memory_with_dummy(memory, ext):
-        if ext == 0:
-            return memory
-        print("shape before", memory.shape)
-        dummy_extension = memory[0].clone().repeat(ext, 1)
-        ret = torch.cat((memory, dummy_extension))
-        print("shape after", memory.shape)
-        return ret
 
     def forward(self, src, memory_bus, memory_pos,
                 mask: Optional[Tensor] = None,
@@ -152,7 +142,7 @@ class IFCEncoder(nn.Module):
         all_shape['M'] = M
         h = all_shape['h']
         w = all_shape['w']
-
+        # print(all_shape)
         # cs839: hence deformable attention is a 2d attention, HxW
         # but IFC MHAtt is flattened 1d attention, HW+M
         # we will fill the memory line to a full width of feature map
@@ -165,11 +155,11 @@ class IFCEncoder(nn.Module):
         if M > w:
             raise ValueError(f"Too larget the memory bus size {M} than the width of feature: {w}")
 
-        memory_pos = self.expand_memory_with_dummy(memory_pos, w-M)
+        memory_pos = self.pad_zero(memory_pos, w-M)
         memory_pos = memory_pos[:, None, :].repeat(1, bs*t, 1)
         pos = torch.cat((pos, memory_pos))
 
-        memory_bus = self.expand_memory_with_dummy(memory_bus, w-M)
+        memory_bus = self.pad_zero(memory_bus, w-M)
         memory_bus = memory_bus[:, None, :].repeat(1, bs*t, 1)
 
         # cs839
@@ -182,6 +172,7 @@ class IFCEncoder(nn.Module):
         src_key_padding_mask = self.pad_one(src_key_padding_mask, w-M, dim=1)
         
         output = src
+
         for layer_idx in range(self.num_layers):
             output = torch.cat((output, memory_bus))
 
@@ -192,6 +183,11 @@ class IFCEncoder(nn.Module):
             memory_bus = memory_bus.view(M, bs, t, c).permute(2,1,0,3).flatten(1,2) # TxBMxC
             memory_bus = self.bus_layers[layer_idx](memory_bus)
             memory_bus = memory_bus.view(t, bs, M, c).permute(2,1,0,3).flatten(1,2) # MxBTxC
+            
+            memory_bus = self.pad_zero(memory_bus, w-M)
+
+        # do not forget to remove the dummy extension
+        memory_bus = memory_bus[:M]
 
         if self.out_norm is not None:
             output = self.out_norm(output)
@@ -311,9 +307,10 @@ class TransformerEncoderLayer(nn.Module):
         return reference_points
 
     @staticmethod
-    def get_valid_ratio(self, mask, all_shape):
+    def get_valid_ratio(mask, all_shape):
         H = all_shape['h']
         W = all_shape['w']
+        mask = mask.view(-1, H, W)
         valid_H = torch.sum(~mask[:, :, 0], 1)
         valid_W = torch.sum(~mask[:, 0, :], 1)
         valid_ratio_h = valid_H.float() / H
@@ -337,11 +334,10 @@ class TransformerEncoderLayer(nn.Module):
             # cs839 different interface for deformable attention
             if all_shape == None:
                 raise ValueError("frame_shape is not provided for forward")
-            spatial_shapes = [(all_shape['h'], all_shape['w'])]
-            spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src.device)
-            level_start_index = [0, src_key_padding_mask.shape[1]]
+            spatial_shapes = torch.as_tensor([(all_shape['h'], all_shape['w'])], dtype=torch.long, device=src.device)
+            level_start_index = torch.as_tensor([0, src_key_padding_mask.shape[1]], dtype=torch.long, device=src.device)
             
-            valid_ratios = self.get_valid_ratio(src_key_padding_mask, all_shape)
+            valid_ratios = torch.stack([self.get_valid_ratio(src_key_padding_mask, all_shape)],1)
             reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
             
             # cs839
