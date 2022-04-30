@@ -3,6 +3,7 @@ https://github.com/facebookresearch/detr
 """
 import copy
 from logging.config import valid_ident
+from signal import default_int_handler
 from typing import Optional
 
 import torch
@@ -18,13 +19,18 @@ class IFCTransformer(nn.Module):
                  num_memory_bus=8, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False,
                  return_intermediate_dec=False,
-                 deformable=0):
+                 deformable=0,
+                 MLPEncoder=0):
         super().__init__()
 
         self.num_frames = num_frames
         self.num_memory_bus = num_memory_bus
+        self.MLPEncoder = MLPEncoder
 
-        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
+        if MLPEncoder:
+            encoder_layer = MLPMixerEncoderLayer(d_model, MLPEncoder, num_memory_bus, dropout, activation)
+        else:
+            encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before, 
                                                 deformable)
         memory_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
@@ -142,7 +148,7 @@ class IFCEncoder(nn.Module):
         all_shape['M'] = M
         h = all_shape['h']
         w = all_shape['w']
-        # print(all_shape)
+        # print("[shapes]", all_shape)
         # cs839: hence deformable attention is a 2d attention, HxW
         # but IFC MHAtt is flattened 1d attention, HW+M
         # we will fill the memory line to a full width of feature map
@@ -174,17 +180,24 @@ class IFCEncoder(nn.Module):
         output = src
 
         for layer_idx in range(self.num_layers):
-            output = torch.cat((output, memory_bus))
-
-            output = self.enc_layers[layer_idx](output, src_mask=mask,
-                           src_key_padding_mask=src_key_padding_mask, pos=pos, all_shape=all_shape)
-            output, memory_bus = output[:hw, :, :], output[hw:hw+M, :, :]
-
-            memory_bus = memory_bus.view(M, bs, t, c).permute(2,1,0,3).flatten(1,2) # TxBMxC
-            memory_bus = self.bus_layers[layer_idx](memory_bus)
-            memory_bus = memory_bus.view(t, bs, M, c).permute(2,1,0,3).flatten(1,2) # MxBTxC
             
-            memory_bus = self.pad_zero(memory_bus, w-M)
+            if not isinstance(self.enc_layers[0], MLPMixerEncoderLayer):
+                output = torch.cat((output, memory_bus))
+                output = self.enc_layers[layer_idx](output, src_mask=mask,
+                           src_key_padding_mask=src_key_padding_mask, pos=pos, all_shape=all_shape)
+                output, memory_bus = output[:hw, :, :], output[hw:hw+M, :, :]
+                memory_bus = memory_bus.view(M, bs, t, c).permute(2,1,0,3).flatten(1,2) # TxBMxC
+                memory_bus = self.bus_layers[layer_idx](memory_bus)
+                memory_bus = memory_bus.view(t, bs, M, c).permute(2,1,0,3).flatten(1,2) # MxBTxC
+                memory_bus = self.pad_zero(memory_bus, w-M)
+            else:
+                output = self.enc_layers[layer_idx](output[:hw, :, :], memory_bus[:M, :, :]) 
+                output, memory_bus = output[:hw, :, :], output[-M:, :, :]
+                memory_bus = memory_bus.view(M, bs, t, c).permute(2,1,0,3).flatten(1,2) # TxBMxC
+                memory_bus = self.bus_layers[layer_idx](memory_bus)
+                memory_bus = memory_bus.view(t, bs, M, c).permute(2,1,0,3).flatten(1,2) # MxBTxC
+            
+            
 
         # do not forget to remove the dummy extension
         memory_bus = memory_bus[:M]
@@ -258,6 +271,80 @@ class IFCDecoder(nn.Module):
             return torch.stack(intermediate)
 
         return output.unsqueeze(0)
+
+class MLP(nn.Module):
+    def __init__(self, d_model, d_hidden=None, activation='gelu'):
+        super().__init__()
+        if not d_hidden:
+            d_hidden = d_model
+        self.l1 = nn.Linear(d_model, d_hidden)
+        self.acti = _get_activation_fn(activation)
+        self.l2 = nn.Linear(d_hidden, d_model)
+        nn.init.kaiming_normal_(self.l1.weight, mode="fan_out", nonlinearity='relu')
+        nn.init.kaiming_normal_(self.l2.weight, mode="fan_out", nonlinearity='relu')
+
+    def forward(self, input):
+        ret = self.l1(input)
+        ret = self.acti(ret)
+        ret = self.l2(ret)
+        return ret
+
+class MLPMixerEncoderLayer(nn.Module):
+    def __init__(self, d_model, max_length=512, memory_bus=8, dropout=0.1, activation="relu"):
+        super().__init__()
+
+        self.d_model = d_model
+        self.max_length = max_length
+        self.memory_bus = memory_bus
+
+        self.tokenMixer = MLP(max_length+memory_bus, d_hidden=15*27+8)
+        self.channelMixer = MLP(d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def pad_zero(self, x, pad, dim=0):
+        if x is None:
+            return None
+        pad_shape = list(x.shape)
+        pad_shape[dim] = pad
+        return torch.cat((x, x.new_zeros(pad_shape)), dim=dim)
+
+    def forward(self, src, memory): # src-(L[hw+m], N, C), mask-(N, L[hw+m]), no need for pos in MLP Mixer
+        
+        NLC2LNC = LNC2NLC = lambda src: src.permute(1,0,2)
+        # assert size
+        src = LNC2NLC(src)
+        memory = LNC2NLC(memory)
+        N = src.shape[0]
+        L = src.shape[1]
+        C = src.shape[2]
+        assert C == self.d_model
+        assert self.memory_bus == memory.shape[1]
+
+        if L < self.max_length:
+            src = self.pad_zero(src, self.max_length-L, dim=1)
+            L = self.max_length
+        elif L > self.max_length:
+            raise ValueError("too large the input image!")
+        # print(src.shape, memory.shape)
+        src = torch.cat((src, memory), dim=1)
+        L += self.memory_bus
+        # print(src.shape)
+        # print(N, L, C)
+        src2 = self.norm1(src).permute(0, 2, 1).flatten(0,1) # N, L ,C -> N, C, L
+        src2 = self.tokenMixer(src2)
+        src2 = src2.view(N, C, L).permute(0, 2, 1) # N, C, L -> N, L ,C
+        src = src + self.dropout1(src2)
+
+        src2 = self.norm2(src).flatten(0,1)
+        src2 = self.channelMixer(src2)
+        src2 = src2.view(N, L, C)
+        src = src + self.dropout2(src2)
+        
+        return NLC2LNC(src)
 
 
 class TransformerEncoderLayer(nn.Module):

@@ -36,6 +36,7 @@ def add_ifc_config(cfg):
     cfg.MODEL.IFC.NUM_OBJECT_QUERIES = 100
 
     cfg.MODEL.IFC.DEFORMABLE = 0
+    cfg.MODEL.IFC.MLP_MIXER = 0
 
     # Evaluation
     cfg.MODEL.IFC.CLIP_STRIDE = 1
