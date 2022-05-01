@@ -46,3 +46,4 @@ def add_ifc_config(cfg):
 
     cfg.SOLVER.OPTIMIZER = "ADAMW"
     cfg.SOLVER.BACKBONE_MULTIPLIER = 0.1
+    cfg.SOLVER.CHECKPOINT_PERIOD = 2000
